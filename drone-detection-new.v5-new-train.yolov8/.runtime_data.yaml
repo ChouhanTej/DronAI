@@ -1,0 +1,15 @@
+names:
+- AirPlane
+- Drone
+- Helicopter
+nc: 3
+path: /Users/chouhantej/Downloads/drone_data/drone-detection-new.v5-new-train.yolov8
+roboflow:
+  license: MIT
+  project: drone-detection-new-peksv
+  url: https://universe.roboflow.com/ahmedmohsen/drone-detection-new-peksv/dataset/5
+  version: 5
+  workspace: ahmedmohsen
+test: test/images
+train: train/images
+val: valid/images
