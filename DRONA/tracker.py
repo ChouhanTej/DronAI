@@ -10,6 +10,7 @@ Run command:
 import argparse
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 import cv2
@@ -22,11 +23,106 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.detector import YOLOObjectDetector
 from src.tracker import DroneTracker, TrackedDrone
 from src.target import TargetAnalyzer, TargetTelemetry
-from src.pantilt import SimulatedPanTiltController
+from src.pantilt import (
+    SimulatedPanTiltController,
+    ESP32PanTiltController,
+)
 
 # Configurable Target Selection Policy: "highest_confidence", "largest", "closest_to_center"
 TARGET_POLICY = "highest_confidence"
 
+class LatestFrameCapture:
+    """
+    Continuously drains a video/MJPEG source in a background thread.
+
+    Only the newest decoded frame is retained.
+    Older frames are intentionally discarded so YOLO does not
+    process a backlog of stale ESP32-CAM frames.
+    """
+
+    def __init__(self, source):
+        self.source = source
+        self.cap = cv2.VideoCapture(source)
+
+        # Some OpenCV backends honor this, some do not.
+        # The background reader is still the main anti-buffering mechanism.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open video source: {source}")
+
+        self._frame = None
+        self._frame_id = 0
+        self._timestamp = 0.0
+
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._running = True
+
+        self._thread = threading.Thread(
+            target=self._reader_loop,
+            name="LatestFrameCapture",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _reader_loop(self):
+        while self._running:
+            ok, frame = self.cap.read()
+
+            if not ok or frame is None:
+                if not self._running:
+                    break
+
+                time.sleep(0.01)
+                continue
+
+            timestamp = time.monotonic()
+
+            with self._condition:
+                self._frame = frame
+                self._timestamp = timestamp
+                self._frame_id += 1
+                self._condition.notify_all()
+
+    def read(self, last_frame_id=-1, timeout=1.0):
+        """
+        Wait for a frame newer than last_frame_id.
+
+        Returns:
+            ok, frame, frame_id, frame_timestamp
+        """
+        deadline = time.monotonic() + timeout
+
+        with self._condition:
+            while self._running and self._frame_id <= last_frame_id:
+                remaining = deadline - time.monotonic()
+
+                if remaining <= 0:
+                    return False, None, last_frame_id, 0.0
+
+                self._condition.wait(timeout=remaining)
+
+            if self._frame is None:
+                return False, None, last_frame_id, 0.0
+
+            return (
+                True,
+                self._frame.copy(),
+                self._frame_id,
+                self._timestamp,
+            )
+
+    def stop(self):
+        self._running = False
+
+        with self._condition:
+            self._condition.notify_all()
+
+        self.cap.release()
+
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 class IntegratedTrackerApp:
     """Integrated Drone Detection, Tracking, and Pan/Tilt Telemetry Application."""
@@ -39,7 +135,11 @@ class IntegratedTrackerApp:
         self.detector = YOLOObjectDetector(model_path=self.model_path, confidence_threshold=0.25)
         self.drone_tracker = DroneTracker(max_lost_frames=15)
         self.target_analyzer = TargetAnalyzer(dead_zone_x=50, dead_zone_y=50)
-        self.pantilt_controller = SimulatedPanTiltController()
+        self.pantilt_controller = ESP32PanTiltController(
+            esp32_ip="192.168.4.1",
+            pan_invert=False,
+            tilt_invert=False,
+        )
 
         self.fps = 0.0
 
@@ -62,14 +162,13 @@ class IntegratedTrackerApp:
         source_is_cam = self.source_arg.isdigit()
         cap_source = int(self.source_arg) if source_is_cam else self.source_arg
 
-        cap = cv2.VideoCapture(cap_source)
-        if source_is_cam:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        if not cap.isOpened():
-            print(f"Error: Could not open video source: {self.source_arg}")
+        try:
+            cap = LatestFrameCapture(cap_source)
+        except RuntimeError as exc:
+            print(f"Error: {exc}")
             return
+
+        last_frame_id = -1
 
         window_name = "Anti-Drone System - Multi-Drone Tracking & Targeting"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -81,10 +180,21 @@ class IntegratedTrackerApp:
         print(f"Source: {self.source_arg} | Target Policy: {self.policy}")
         print("Press 'q' or 'ESC' to exit.\n")
 
-        while cap.isOpened():
-            ret, frame = cap.read()
+        while True:
+            ret, frame, frame_id, frame_timestamp = cap.read(
+                last_frame_id=last_frame_id,
+                timeout=2.0,
+            )
+
             if not ret or frame is None:
-                break
+                print("Warning: no new frame received.")
+                continue
+
+            last_frame_id = frame_id
+
+            frame_age_ms = (
+                time.monotonic() - frame_timestamp
+    ) * 1000.0
 
             curr_time = time.time()
             dt = curr_time - prev_time
@@ -106,13 +216,18 @@ class IntegratedTrackerApp:
             telemetry: Optional[TargetTelemetry] = None
 
             if primary_drone:
-                telemetry = self.target_analyzer.analyze(primary_drone, w, h)
-                self.pantilt_controller.update(
-                    telemetry.pan_direction,
-                    telemetry.tilt_direction,
-                    telemetry.error_x,
-                    telemetry.error_y,
+                telemetry = self.target_analyzer.analyze(
+                    primary_drone,
+                    w,
+                    h,
                 )
+                if primary_drone.lost_frames == 0:
+                    self.pantilt_controller.update(
+                        telemetry.pan_direction,
+                        telemetry.tilt_direction,
+                        telemetry.error_x,
+                        telemetry.error_y,
+                    )
 
             # --- VISUALIZATION OVERLAYS ---
 
@@ -180,7 +295,17 @@ class IntegratedTrackerApp:
                 cv2.putText(frame, alert_text, ((w - tw) // 2, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
             # OSD Dashboard Side Panel
-            self._render_osd_panel(frame, active_drones, telemetry, w, h)
+            # self._render_osd_panel(frame, active_drones, telemetry, w, h)
+
+            cv2.putText(
+                frame,
+                f"Frame age: {frame_age_ms:.0f} ms",
+                (10, h - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1,
+            )
 
             cv2.imshow(window_name, frame)
 
@@ -188,7 +313,7 @@ class IntegratedTrackerApp:
             if key in (ord('q'), ord('Q'), 27):
                 break
 
-        cap.release()
+        cap.stop()
         cv2.destroyAllWindows()
         print("Tracking application terminated cleanly.")
 
